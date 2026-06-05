@@ -17,20 +17,6 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(pmw3610, CONFIG_PMW3610_LOG_LEVEL);
 
-/* --- Runaway / "warp" guard tunables (fork patch) ---------------------------
- * The first motion bursts emitted right after the sensor wakes from a deep REST
- * (e.g. after ZMK enters its IDLE activity state and force-awake is released)
- * can carry stale / saturated 12-bit deltas. Upstream badjeff zmk-0.3 decodes
- * them blindly; because the motion IRQ is level-triggered and force-awake then
- * re-arms continuous sampling, they get streamed as a ~1s cursor/scroll
- * "runaway" (see badjeff/zmk-pmw3610-driver issue #12). We (a) honour the
- * sensor's MOT status bit (parity with Zephyr's input_pmw3610.c) and (b) drop
- * implausibly large deltas for a short window after resuming from rest. */
-#define PMW3610_MOTION_STATUS_MOT BIT(7)  /* MOTION reg: motion-detected bit */
-#define PMW3610_WARP_REST_GAP_MS  500     /* gap (ms) implying the sensor had rested */
-#define PMW3610_WARP_WINDOW_MS    250     /* scrutiny window (ms) after resume; re-armed per warp */
-#define PMW3610_WARP_DELTA_THRES  300     /* |delta|/frame above this == implausible warp, dropped */
-
 //////// Sensor initialization steps definition //////////
 // init is done in non-blocking manner (i.e., async), a //
 // delayable work is defined for this purpose           //
@@ -461,14 +447,6 @@ static int pmw3610_report_data(const struct device *dev) {
     }
     // LOG_HEXDUMP_DBG(buf, PMW3610_BURST_SIZE, "buf");
 
-    /* Honour the sensor's motion-detected (MOT) status bit. Upstream Zephyr's
-     * input_pmw3610.c returns here when MOT is clear; the badjeff driver omitted
-     * this and decoded stale delta registers as bogus motion, which is a key
-     * contributor to the post-idle runaway. */
-    if (!(buf[0] & PMW3610_MOTION_STATUS_MOT)) {
-        return 0;
-    }
-
 // 12-bit two's complement value to int16_t
 // adapted from https://stackoverflow.com/questions/70802306/convert-a-12-bit-signed-number-in-c
 #define TOINT16(val, bits) (((struct { int16_t value : bits; }){val}).value)
@@ -477,26 +455,31 @@ static int pmw3610_report_data(const struct device *dev) {
     int16_t y = TOINT16((buf[PMW3610_Y_L_POS] + ((buf[PMW3610_XY_H_POS] & 0x0F) << 8)), 12);
     LOG_DBG("x/y: %d/%d", x, y);
 
-    /* Anti-warp: for a short window after the sensor resumes from rest, drop any
-     * implausibly large per-frame delta (a saturated first burst out of deep
-     * REST). Normal motion (well under the threshold) passes straight through,
-     * so there is no added latency for ordinary use; the window re-arms on each
-     * dropped frame so a multi-frame warp burst is fully suppressed. */
-    {
-        static int64_t aw_last = 0;
-        static int64_t aw_block_until = 0;
-        int64_t aw_now = k_uptime_get();
-        if (aw_now - aw_last > PMW3610_WARP_REST_GAP_MS) {
-            aw_block_until = aw_now + PMW3610_WARP_WINDOW_MS;
-        }
-        aw_last = aw_now;
-        if (aw_now < aw_block_until &&
-            (x > PMW3610_WARP_DELTA_THRES || x < -PMW3610_WARP_DELTA_THRES ||
-             y > PMW3610_WARP_DELTA_THRES || y < -PMW3610_WARP_DELTA_THRES)) {
-            LOG_WRN("anti-warp: dropped large delta (%d,%d) after rest", x, y);
-            aw_block_until = aw_now + PMW3610_WARP_WINDOW_MS; /* re-arm while warping */
-            return 0;
-        }
+#if CONFIG_PMW3610_MAX_DELTA > 0
+    /* Spike reject for the flaky 3-wire SDIO (ported from kobu). The buf[0]==0xFF
+     * gate below only catches a FULL float; a PARTIAL glitch (buf[0] valid but
+     * buf[XY_H] corrupted) decodes to a huge delta — a single sign-nibble flip
+     * yields ±256..±2048 — which an un-clamped scaler turns into a sudden "gyun"
+     * jump. A real hand-roll never exceeds CONFIG_PMW3610_MAX_DELTA counts in one
+     * sample, so drop the offending axis. Enable on the flaky/scroll half only;
+     * leave unset on the pointer half so fast cursor flicks are never capped. */
+    if (x > CONFIG_PMW3610_MAX_DELTA || x < -CONFIG_PMW3610_MAX_DELTA) x = 0;
+    if (y > CONFIG_PMW3610_MAX_DELTA || y < -CONFIG_PMW3610_MAX_DELTA) y = 0;
+#endif
+
+    /* Reject a failed/glitched 3-wire SPI read (ported from kobu). The shared
+     * SDIO line can intermittently fail to read back, floating high so the whole
+     * burst returns 0xFF. buf[0] is the MOTION status register, whose
+     * lower/reserved bits can never legitimately read all-ones, so buf[0]==0xFF
+     * is a reliable garbage signature; without this it both sets the MOT bit AND
+     * decodes to nonzero x/y -> phantom motion. NOTE: kobu hardware-testing found
+     * a MOT-bit gate is the WRONG filter here — in force-awake mode the MOT bit
+     * is unreliable for genuine (esp. slow) motion, while a truly idle sensor
+     * already returns x=y=0 — so this garbage drop replaces any MOT gate. */
+    if (buf[0] == 0xFF) {
+        dx = 0;
+        dy = 0;
+        return 0;
     }
 
 #ifdef CONFIG_PMW3610_SMART_ALGORITHM
@@ -693,23 +676,19 @@ static const struct sensor_driver_api pmw3610_driver_api = {
     .attr_set = pmw3610_attr_set,
 };
 
-/* Re-enabled (was deprecated upstream in commit f5ce7c4). When CONFIG_PM_DEVICE
- * is enabled (e.g. once CONFIG_ZMK_SLEEP is turned on), this masks the level-
- * triggered motion IRQ across device suspend so the sensor cannot stream stale
- * motion on resume. Inert (compiled out) when CONFIG_PM_DEVICE is off, which is
- * the case for the IDLE-only path this fork primarily targets. */
-#if IS_ENABLED(CONFIG_PM_DEVICE)
-static int pmw3610_pm_action(const struct device *dev, enum pm_device_action action) {
-    switch (action) {
-    case PM_DEVICE_ACTION_SUSPEND:
-        return pmw3610_set_interrupt(dev, false);
-    case PM_DEVICE_ACTION_RESUME:
-        return pmw3610_set_interrupt(dev, true);
-    default:
-        return -ENOTSUP;
-    }
-}
-#endif // IS_ENABLED(CONFIG_PM_DEVICE)
+// #if IS_ENABLED(CONFIG_PM_DEVICE)
+// static int pmw3610_pm_action(const struct device *dev, enum pm_device_action action) {
+//     switch (action) {
+//     case PM_DEVICE_ACTION_SUSPEND:
+//         return pmw3610_set_interrupt(dev, false);
+//     case PM_DEVICE_ACTION_RESUME:
+//         return pmw3610_set_interrupt(dev, true);
+//     default:
+//         return -ENOTSUP;
+//     }
+// }
+// #endif // IS_ENABLED(CONFIG_PM_DEVICE)
+// PM_DEVICE_DT_INST_DEFINE(n, pmw3610_pm_action);
 
 #define PMW3610_SPI_MODE (SPI_OP_MODE_MASTER | SPI_WORD_SET(8) | SPI_MODE_CPOL | \
                         SPI_MODE_CPHA | SPI_TRANSFER_MSB)
@@ -729,9 +708,8 @@ static int pmw3610_pm_action(const struct device *dev, enum pm_device_action act
         .force_awake = DT_PROP(DT_DRV_INST(n), force_awake),                                       \
         .force_awake_4ms_mode = DT_PROP(DT_DRV_INST(n), force_awake_4ms_mode),                     \
     };                                                                                             \
-    PM_DEVICE_DT_INST_DEFINE(n, pmw3610_pm_action);                                                \
-    DEVICE_DT_INST_DEFINE(n, pmw3610_init, PM_DEVICE_DT_INST_GET(n), &data##n, &config##n,         \
-                          POST_KERNEL, CONFIG_INPUT_PMW3610_INIT_PRIORITY, &pmw3610_driver_api);
+    DEVICE_DT_INST_DEFINE(n, pmw3610_init, NULL, &data##n, &config##n, POST_KERNEL,                \
+                          CONFIG_INPUT_PMW3610_INIT_PRIORITY, &pmw3610_driver_api);
 
 DT_INST_FOREACH_STATUS_OKAY(PMW3610_DEFINE)
 
@@ -750,9 +728,17 @@ static int on_activity_state(const zmk_event_t *eh) {
         return 0;
     }
 
-    bool enable = state_ev->state == ZMK_ACTIVITY_ACTIVE ? 1 : 0;
+    /* Keep force-awake sensors PINNED in RUN mode across ALL activity changes
+     * (ported from kobu, matching the RMK firmware which sets force_awake once
+     * at init and never downshifts). The original `ACTIVE ? 1 : 0` dropped the
+     * force-awake balls into NORMAL on ZMK IDLE, letting them REST; a rested,
+     * re-awakening sensor emits a noisy/saturated first frame that the
+     * level-triggered IRQ streams as a ~1s post-idle cursor/scroll "runaway".
+     * Never downshifting removes that wake transition entirely — this is the
+     * real root-cause fix. set_performance() self-gates on config->force_awake,
+     * so it is a no-op for non-force-awake sensors. */
     for (size_t i = 0; i < ARRAY_SIZE(pmw3610_devs); i++) {
-        pmw3610_set_performance(pmw3610_devs[i], enable);
+        pmw3610_set_performance(pmw3610_devs[i], true);
     }
 
     return 0;
